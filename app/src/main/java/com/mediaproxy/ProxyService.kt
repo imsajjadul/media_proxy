@@ -46,7 +46,7 @@ class ProxyService : Service() {
 
         try {
             server?.stop()
-            server = WebDAVServer(port, sources)
+            server = WebDAVServer(port, sources, this)
             server?.start()
             server?.prefetchSources()
             isRunning = true
