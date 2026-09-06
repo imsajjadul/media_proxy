@@ -1,4 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_name">Media Proxy</string>
+    <string name="tmdb_api_key" translatable="false">31375adbc8e9efdf2b82af1edf2c5ea3</string>
 </resources>
