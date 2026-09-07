@@ -96,7 +96,7 @@ class WebDAVServer(
         }
 
         var url = buildUpstreamUrl(decodedPath) ?: return null
-        if (!url.endsWith("/")) url += "/"
+        if (!url.endsWith('/')) url += '/'/'
 
         Log.d(TAG, "fetchIndex: $url")
 
@@ -299,7 +299,7 @@ class WebDAVServer(
     )
 
     private fun guessMime(name: String): String {
-        val ext = name.substringAfterLast('.', "").lowercase()
+        val ext = name.substringAfterLast('.', '').lowercase()
         return mimeMap[ext] ?: "application/octet-stream"
     }
 
@@ -309,7 +309,7 @@ class WebDAVServer(
         return s.replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
-            .replace(""", "&quot;")
+            .replace("\"", "&quot;")
             .replace("'", "&apos;")
     }
 
@@ -560,7 +560,7 @@ class WebDAVServer(
 
             if (info != null) {
                 val fileName = lastSegment
-                val href = "/" + decodedPath.trimStart('/')
+                val href = '/' + decodedPath.trimStart('/')
 
                 val body = xmlPropFile(
                     href,
@@ -592,7 +592,7 @@ class WebDAVServer(
 
             val body = StringBuilder(entries.size * 300)
 
-            val hrefPath = "/" + dirPath.trim('/') + "/"
+            val hrefPath = '/' + dirPath.trim('/') + '/'
             val dirName =
                 dirPath.trimEnd('/')
                     .substringAfterLast('/')
@@ -671,7 +671,7 @@ class WebDAVServer(
 
             if (info != null) {
                 val fileName = lastSegment
-                val href = "/" + decodedPath.trimStart('/')
+                val href = '/' + decodedPath.trimStart('/')
 
                 val body = xmlPropFile(
                     href,
@@ -816,7 +816,7 @@ class WebDAVServer(
     }
 
     // ═══════════════════════════════════════════════════════════════
-    //  BDIX Hub — New Methods (append at bottom of class)
+    //  BDIX Hub — New Methods
     // ═══════════════════════════════════════════════════════════════
 
     private fun serveHub(): Response {
@@ -913,13 +913,13 @@ class WebDAVServer(
         for ((dirPath, entries) in indexCache) {
             for (e in entries) {
                 if (e.displayName.lowercase().contains(q)) {
-                    val fullPath = dirPath + "/" + e.displayName.trimEnd('/')
+                    val fullPath = dirPath + '/' + e.displayName.trimEnd('/')
                     results.put(
                         JSONObject()
                             .put("path", fullPath)
                             .put("name", e.displayName)
                             .put("is_dir", e.isDir)
-                            .put("source", dirPath.substringBefore('/'))
+                            .put('source', dirPath.substringBefore('/'))
                     )
                 }
             }
