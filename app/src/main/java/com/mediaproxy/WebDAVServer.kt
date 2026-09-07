@@ -1,11 +1,10 @@
 package com.mediaproxy
 
 import android.content.Context
-import org.json.JSONArray
-import org.json.JSONObject
-import java.io.ByteArrayInputStream
 import android.util.Log
 import fi.iki.elonen.NanoHTTPD
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.InputStream
 import java.net.HttpURLConnection
 import java.net.URL
@@ -20,7 +19,7 @@ import java.util.regex.Pattern
 class WebDAVServer(
     private val port: Int,
     private val sources: List<Source>,
-    private val context: android.content.Context? = null
+    private val context: Context? = null
 ) : NanoHTTPD(port) {
 
     companion object {
@@ -38,9 +37,11 @@ class WebDAVServer(
 
     private val indexCache = ConcurrentHashMap<String, List<IndexEntry>>()
     private val xmlCache = ConcurrentHashMap<String, String>()
+    private val prefetchExecutor = Executors.newSingleThreadExecutor()
+
+    // BDIX Hub additions
     private val tmdbClient = context?.let { TmdbClient(it) }
     private val mediaCache = context?.let { MediaCache(it) }
-    private val prefetchExecutor = Executors.newSingleThreadExecutor()
 
     private fun encodeSegment(segment: String): String {
         return URLEncoder.encode(segment, "UTF-8")
@@ -76,187 +77,12 @@ class WebDAVServer(
         }
     }
 
-private fun serveHub(): Response {
-        return try {
-            val stream = context?.assets?.open("hub/index.html")
-                ?: return newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Hub UI missing")
-            val html = stream.bufferedReader().use { it.readText() }
-            newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
-        } catch (e: Exception) {
-            Log.e(TAG, "serveHub error: ${e.message}")
-            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Hub error")
-        }
-    }
-
-    private fun serveApi(session: IHTTPSession, path: String): Response {
-        return when {
-            path == "/api/sources" -> serveApiSources()
-            path.startsWith("/api/browse") -> serveApiBrowse(session)
-            path.startsWith("/api/search") -> serveApiSearch(session)
-            path.startsWith("/api/meta") -> serveApiMeta(session)
-            path.startsWith("/api/resolve") -> serveApiResolve(session)
-            else -> jsonResponse(404, JSONObject().put("error", "Not found").toString())
-        }
-    }
-
-    private fun jsonResponse(status: Int, body: String): Response {
-        val resp = newFixedLengthResponse(
-            Response.Status.lookup(status) ?: Response.Status.OK,
-            "application/json; charset=utf-8",
-            body
-        )
-        resp.addHeader("Access-Control-Allow-Origin", "*")
-        return resp
-    }
-
-    private fun serveApiSources(): Response {
-        val arr = JSONArray()
-        for (s in sources) {
-            arr.put(JSONObject().put("name", s.name).put("url", s.url))
-        }
-        return jsonResponse(200, arr.toString())
-    }
-
-    private fun serveApiBrowse(session: IHTTPSession): Response {
-        val path = session.parameters["path"]?.firstOrNull()
-            ?: return jsonResponse(400, JSONObject().put("error", "Missing path").toString())
-        val decodedPath = URLDecoder.decode(path, "UTF-8")
-        val entries = fetchIndex(decodedPath)
-            ?: return jsonResponse(404, JSONObject().put("error", "Not found").toString())
-
-        // Cache entries for search
-        mediaCache?.insertBatch(decodedPath, entries)
-
-        val arr = JSONArray()
-        for (e in entries) {
-            val movieMeta = looksLikeMovie(e.displayName)
-            arr.put(JSONObject()
-                .put("name", e.displayName)
-                .put("is_dir", e.isDir)
-                .put("date", e.dateStr)
-                .put("size", parseNginxSize(e.sizeStr))
-                .put("is_movie", movieMeta != null)
-            )
-        }
-        val obj = JSONObject()
-            .put("path", decodedPath)
-            .put("entries", arr)
-        return jsonResponse(200, obj.toString())
-    }
-
-    private fun serveApiSearch(session: IHTTPSession): Response {
-        val q = session.parameters["q"]?.firstOrNull()?.lowercase()
-            ?: return jsonResponse(400, JSONObject().put("error", "Missing q").toString())
-
-        val results = JSONArray()
-
-        // 1. Search cached index entries
-        for ((dirPath, entries) in indexCache) {
-            for (e in entries) {
-                if (e.displayName.lowercase().contains(q)) {
-                    val fullPath = dirPath + "/" + e.displayName.trimEnd('/')
-                    results.put(JSONObject()
-                        .put("path", fullPath)
-                        .put("name", e.displayName)
-                        .put("is_dir", e.isDir)
-                        .put("source", dirPath.substringBefore('/'))
-                    )
-                }
-            }
-        }
-
-        // 2. Search SQLite cache (deeper)
-        val dbResults = mediaCache?.search(q) ?: emptyList()
-        for (r in dbResults) {
-            results.put(JSONObject()
-                .put("path", r.path)
-                .put("name", r.name)
-                .put("is_dir", r.isDir)
-                .put("source", r.source)
-            )
-        }
-
-        return jsonResponse(200, JSONObject().put("results", results).toString())
-    }
-
-    private fun serveApiMeta(session: IHTTPSession): Response {
-        val title = session.parameters["title"]?.firstOrNull()
-            ?: return jsonResponse(400, JSONObject().put("error", "Missing title").toString())
-        val year = session.parameters["year"]?.firstOrNull()
-
-        // Check cache first
-        val cached = mediaCache?.getMeta(title, year)
-        if (cached != null) {
-            return jsonResponse(200, cached)
-        }
-
-        // Fetch from TMDB
-        val meta = tmdbClient?.searchMovie(title, year)
-        if (meta != null) {
-            mediaCache?.putMeta(title, year, meta)
-            return jsonResponse(200, meta)
-        }
-
-        return jsonResponse(200, JSONObject()
-            .put("title", title)
-            .put("year", year ?: JSONObject.NULL)
-            .put("poster_path", JSONObject.NULL)
-            .put("overview", "")
-            .put("vote_average", JSONObject.NULL)
-            .toString()
-        )
-    }
-
-    private fun serveApiResolve(session: IHTTPSession): Response {
-        val path = session.parameters["path"]?.firstOrNull()
-            ?: return jsonResponse(400, JSONObject().put("error", "Missing path").toString())
-        val decodedPath = URLDecoder.decode(path, "UTF-8")
-        val directUrl = buildUpstreamUrl(decodedPath) ?: ""
-        val proxyUrl = "http://127.0.0.1:$port${session.uri}"
-
-        // Find subtitles in same parent directory
-        val subtitles = JSONArray()
-        val parent = decodedPath.substringBeforeLast('/', '')
-        if (parent.isNotEmpty()) {
-            val parentEntries = fetchIndex("$parent/") ?: emptyList()
-            for (e in parentEntries) {
-                if (!e.isDir && e.displayName.endsWith(".srt", true)) {
-                    val subPath = "$parent/${e.displayName}"
-                    val subUrl = buildUpstreamUrl(subPath)
-                    if (subUrl != null) {
-                        subtitles.put(JSONObject()
-                            .put("url", subUrl)
-                            .put("lang", "en")
-                            .put("name", e.displayName)
-                        )
-                    }
-                }
-            }
-        }
-
-        val obj = JSONObject()
-            .put("direct_url", directUrl)
-            .put("proxy_url", proxyUrl)
-            .put("subtitles", subtitles)
-        return jsonResponse(200, obj.toString())
-    }
-
-    private fun looksLikeMovie(name: String): Pair<String, String>? {
-        val m = Regex("""^(.+?)\s*\((\d{4})\)$""").find(name.trimEnd('/'))
-        return if (m != null) Pair(m.groupValues[1].trim(), m.groupValues[2]) else null
-    }
-    
     // ── Index parsing ──
 
-    // Existing nginx autoindex format.
     private val indexPattern: Pattern = Pattern.compile(
         """<a href="([^"]+)">([^<]+)</a>\s+(\d{2}-\w{3}-\d{4}\s+\d{2}:\d{2})\s+(-|\d[\d.]*\w?)"""
     )
 
-    // h5ai v0.29.x fallback table used by Dhaka-Flix:
-    // <td class="fb-n"><a href="...">Name</a></td>
-    // <td class="fb-d">2026-01-13 00:19</td>
-    // <td class="fb-s">996028 KB</td>
     private val h5aiIndexPattern: Pattern = Pattern.compile(
         """<td class="fb-n">\s*<a href="([^"]+)">([^<]*)</a>\s*</td>\s*<td class="fb-d">([^<]*)</td>\s*<td class="fb-s">([^<]*)</td>"""
     )
@@ -292,7 +118,6 @@ private fun serveHub(): Response {
 
             val entries = mutableListOf<IndexEntry>()
 
-            // 1. Existing nginx parser.
             val matcher = indexPattern.matcher(html)
             while (matcher.find()) {
                 val rawHref = matcher.group(1) ?: continue
@@ -311,9 +136,6 @@ private fun serveHub(): Response {
                 entries.add(IndexEntry(displayName, isDir, dateStr, sizeStr))
             }
 
-            // 2. h5ai fallback parser.
-            // This runs only when the nginx parser found nothing,
-            // preserving compatibility with existing nginx sources.
             if (entries.isEmpty()) {
                 val h5aiMatcher = h5aiIndexPattern.matcher(html)
 
@@ -363,10 +185,6 @@ private fun serveHub(): Response {
         }
     }
 
-    /**
-     * Pre-fetch source root directories in background when server starts.
-     * This warms the cache so Nova's first request is instant.
-     */
     fun prefetchSources() {
         prefetchExecutor.submit {
             Log.i(TAG, "Pre-fetching ${sources.size} source(s)...")
@@ -430,21 +248,11 @@ private fun serveHub(): Response {
 
     // ── Nginx / h5ai size parser ──
 
-    /**
-     * Convert nginx/h5ai human-readable size to bytes.
-     *
-     * nginx:
-     *   5G, 250M, 1.2G, 500K, 12345, -
-     *
-     * h5ai:
-     *   996028 KB, 78 KB, 1.2 GB, -
-     */
     private fun parseNginxSize(sizeStr: String): String {
         val s = sizeStr.trim()
 
         if (s == "-" || s.isEmpty()) return ""
 
-        // Pure number = already bytes.
         s.toLongOrNull()?.let { return it.toString() }
 
         val match = Regex(
@@ -501,14 +309,14 @@ private fun serveHub(): Response {
         return s.replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
-            .replace("\"", "&quot;")
+            .replace(""", "&quot;")
             .replace("'", "&apos;")
     }
 
     private fun formatDate(dateStr: String): String {
         val formats = listOf(
-            "dd-MMM-yyyy HH:mm",  // nginx autoindex
-            "yyyy-MM-dd HH:mm"    // h5ai
+            "dd-MMM-yyyy HH:mm",
+            "yyyy-MM-dd HH:mm"
         )
 
         for (format in formats) {
@@ -524,14 +332,13 @@ private fun serveHub(): Response {
                     return formatter.format(date)
                 }
             } catch (_: Exception) {
-                // Try next supported format.
             }
         }
 
         return ""
     }
 
-    // ── HEAD upstream (gets real file size) ──
+    // ── HEAD upstream ──
 
     private fun headUpstream(decodedPath: String): Map<String, String>? {
         val url = buildUpstreamUrl(decodedPath) ?: return null
@@ -555,15 +362,12 @@ private fun serveHub(): Response {
             conn.getHeaderField("Content-Length")?.let {
                 headers["Content-Length"] = it
             }
-
             conn.getHeaderField("Content-Type")?.let {
                 headers["Content-Type"] = it
             }
-
             conn.getHeaderField("Accept-Ranges")?.let {
                 headers["Accept-Ranges"] = it
             }
-
             conn.getHeaderField("Last-Modified")?.let {
                 headers["Last-Modified"] = it
             }
@@ -642,41 +446,10 @@ private fun serveHub(): Response {
         val method = session.method.name.uppercase()
 
         if (method == "PROPFIND") {
-            try { session.parseBody(HashMap<String, String>()) } catch (_: Exception) {}
-        }
-
-        val decodedPath = try { URLDecoder.decode(session.uri, "UTF-8") } catch (_: Exception) { session.uri }
-        Log.d(TAG, "$method $decodedPath")
-
-        // ── BDIX Hub routes ──
-        when {
-            decodedPath == "/hub" || decodedPath == "/hub/" -> return serveHub()
-            decodedPath.startsWith("/api/") -> return serveApi(session, decodedPath)
-        }
-
-        // existing WebDAV handling continues below...
-        return try {
-            when (method) {
-                "OPTIONS" -> handleOptions()
-                "PROPFIND" -> handlePropfind(decodedPath, session)
-                "GET" -> handleGet(decodedPath, session)
-                "HEAD" -> handleHead(decodedPath)
-                else -> newFixedLengthResponse(Response.Status.METHOD_NOT_ALLOWED, MIME_PLAINTEXT, "Method not allowed")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error handling $method $decodedPath: ${e.message}", e)
-            newFixedLengthResponse(Response.Status.INTERNAL_ERROR, MIME_PLAINTEXT, "Error: ${e.message}")
-        }
-    }
-
-        // NanoHTTPD quirk: methods with a body such as PROPFIND
-        // require parseBody() to be called.
-        if (method == "PROPFIND") {
             try {
                 val files = HashMap<String, String>()
                 session.parseBody(files)
             } catch (_: Exception) {
-                // We don't need the PROPFIND body.
             }
         }
 
@@ -687,6 +460,12 @@ private fun serveHub(): Response {
         }
 
         Log.d(TAG, "$method $decodedPath")
+
+        // ── BDIX Hub routes (intercept before WebDAV) ──
+        when {
+            decodedPath == "/hub" || decodedPath == "/hub/" -> return serveHub()
+            decodedPath.startsWith("/api/") -> return serveApi(session, decodedPath)
+        }
 
         return try {
             when (method) {
@@ -732,7 +511,6 @@ private fun serveHub(): Response {
         val depth = session.headers["depth"] ?: "1"
         val trimmed = decodedPath.trim('/')
 
-        // Root: show source folders.
         if (trimmed.isEmpty()) {
             val body = StringBuilder()
 
@@ -752,7 +530,6 @@ private fun serveHub(): Response {
             return resp207(wrapMultistatus(body.toString()))
         }
 
-        // Is this a path to a known source?
         val slashIdx = trimmed.indexOf('/')
         val sourceName =
             if (slashIdx >= 0) trimmed.substring(0, slashIdx)
@@ -766,7 +543,6 @@ private fun serveHub(): Response {
             )
         }
 
-        // Determine if this looks like a file.
         val lastSegment = trimmed.substringAfterLast('/')
 
         val looksLikeFile =
@@ -797,11 +573,9 @@ private fun serveHub(): Response {
                 return resp207(wrapMultistatus(body))
             }
 
-            // HEAD failed — maybe it's a directory with a dot in the name.
             Log.d(TAG, "HEAD failed for file-like path, trying as directory")
         }
 
-        // Directory path — fetch index listing.
         val dirPath =
             if (decodedPath.endsWith("/")) decodedPath
             else "$decodedPath/"
@@ -839,7 +613,6 @@ private fun serveHub(): Response {
                     val childHref =
                         hrefPath + childName + (if (entry.isDir) "/" else "")
 
-                    // Skip date parsing for huge directories.
                     val lastMod =
                         if (isLargeDir) ""
                         else formatDate(entry.dateStr)
@@ -893,7 +666,6 @@ private fun serveHub(): Response {
             return resp207(xml)
         }
 
-        // Last resort: try HEAD as file for paths without known extensions.
         if (!looksLikeFile) {
             val info = headUpstream(decodedPath)
 
@@ -938,7 +710,6 @@ private fun serveHub(): Response {
         conn.readTimeout = 0
         conn.instanceFollowRedirects = true
 
-        // Forward range header for seeking.
         val range = session.headers["range"]
 
         if (range != null) {
@@ -992,7 +763,6 @@ private fun serveHub(): Response {
                 )
             }
 
-        // Headers critical for video playback.
         resp.addHeader("Accept-Ranges", "bytes")
 
         conn.getHeaderField("Content-Range")?.let {
@@ -1043,5 +813,202 @@ private fun serveHub(): Response {
             "application/xml; charset=utf-8",
             xml
         )
+    }
+
+    // ═══════════════════════════════════════════════════════════════
+    //  BDIX Hub — New Methods (append at bottom of class)
+    // ═══════════════════════════════════════════════════════════════
+
+    private fun serveHub(): Response {
+        return try {
+            val stream = context?.assets?.open("hub/index.html")
+                ?: return newFixedLengthResponse(
+                    Response.Status.INTERNAL_ERROR,
+                    MIME_PLAINTEXT,
+                    "Hub UI missing"
+                )
+            val html = stream.bufferedReader().use { it.readText() }
+            newFixedLengthResponse(Response.Status.OK, "text/html; charset=utf-8", html)
+        } catch (e: Exception) {
+            Log.e(TAG, "serveHub error: ${e.message}")
+            newFixedLengthResponse(
+                Response.Status.INTERNAL_ERROR,
+                MIME_PLAINTEXT,
+                "Hub error"
+            )
+        }
+    }
+
+    private fun serveApi(session: IHTTPSession, path: String): Response {
+        return when {
+            path == "/api/sources" -> serveApiSources()
+            path.startsWith("/api/browse") -> serveApiBrowse(session)
+            path.startsWith("/api/search") -> serveApiSearch(session)
+            path.startsWith("/api/meta") -> serveApiMeta(session)
+            path.startsWith("/api/resolve") -> serveApiResolve(session)
+            else -> jsonResponse(404, JSONObject().put("error", "Not found").toString())
+        }
+    }
+
+    private fun jsonResponse(status: Int, body: String): Response {
+        val resp = newFixedLengthResponse(
+            Response.Status.lookup(status) ?: Response.Status.OK,
+            "application/json; charset=utf-8",
+            body
+        )
+        resp.addHeader("Access-Control-Allow-Origin", "*")
+        return resp
+    }
+
+    private fun serveApiSources(): Response {
+        val arr = JSONArray()
+        for (s in sources) {
+            arr.put(JSONObject().put("name", s.name).put("url", s.url))
+        }
+        return jsonResponse(200, arr.toString())
+    }
+
+    private fun serveApiBrowse(session: IHTTPSession): Response {
+        val path = session.parameters["path"]?.firstOrNull()
+            ?: return jsonResponse(
+                400,
+                JSONObject().put("error", "Missing path").toString()
+            )
+        val decodedPath = URLDecoder.decode(path, "UTF-8")
+        val entries = fetchIndex(decodedPath)
+            ?: return jsonResponse(
+                404,
+                JSONObject().put("error", "Not found").toString()
+            )
+
+        mediaCache?.insertBatch(decodedPath, entries)
+
+        val arr = JSONArray()
+        for (e in entries) {
+            val movieMeta = looksLikeMovie(e.displayName)
+            arr.put(
+                JSONObject()
+                    .put("name", e.displayName)
+                    .put("is_dir", e.isDir)
+                    .put("date", e.dateStr)
+                    .put("size", parseNginxSize(e.sizeStr))
+                    .put("is_movie", movieMeta != null)
+            )
+        }
+        val obj = JSONObject()
+            .put("path", decodedPath)
+            .put("entries", arr)
+        return jsonResponse(200, obj.toString())
+    }
+
+    private fun serveApiSearch(session: IHTTPSession): Response {
+        val q = session.parameters["q"]?.firstOrNull()?.lowercase()
+            ?: return jsonResponse(
+                400,
+                JSONObject().put("error", "Missing q").toString()
+            )
+
+        val results = JSONArray()
+
+        for ((dirPath, entries) in indexCache) {
+            for (e in entries) {
+                if (e.displayName.lowercase().contains(q)) {
+                    val fullPath = dirPath + "/" + e.displayName.trimEnd('/')
+                    results.put(
+                        JSONObject()
+                            .put("path", fullPath)
+                            .put("name", e.displayName)
+                            .put("is_dir", e.isDir)
+                            .put("source", dirPath.substringBefore('/'))
+                    )
+                }
+            }
+        }
+
+        val dbResults = mediaCache?.search(q) ?: emptyList()
+        for (r in dbResults) {
+            results.put(
+                JSONObject()
+                    .put("path", r.path)
+                    .put("name", r.name)
+                    .put("is_dir", r.isDir)
+                    .put("source", r.source)
+            )
+        }
+
+        return jsonResponse(200, JSONObject().put("results", results).toString())
+    }
+
+    private fun serveApiMeta(session: IHTTPSession): Response {
+        val title = session.parameters["title"]?.firstOrNull()
+            ?: return jsonResponse(
+                400,
+                JSONObject().put("error", "Missing title").toString()
+            )
+        val year = session.parameters["year"]?.firstOrNull()
+
+        val cached = mediaCache?.getMeta(title, year)
+        if (cached != null) {
+            return jsonResponse(200, cached)
+        }
+
+        val meta = tmdbClient?.searchMovie(title, year)
+        if (meta != null) {
+            mediaCache?.putMeta(title, year, meta)
+            return jsonResponse(200, meta)
+        }
+
+        return jsonResponse(
+            200,
+            JSONObject()
+                .put("title", title)
+                .put("year", year ?: JSONObject.NULL)
+                .put("poster_path", JSONObject.NULL)
+                .put("overview", "")
+                .put("vote_average", JSONObject.NULL)
+                .toString()
+        )
+    }
+
+    private fun serveApiResolve(session: IHTTPSession): Response {
+        val path = session.parameters["path"]?.firstOrNull()
+            ?: return jsonResponse(
+                400,
+                JSONObject().put("error", "Missing path").toString()
+            )
+        val decodedPath = URLDecoder.decode(path, "UTF-8")
+        val directUrl = buildUpstreamUrl(decodedPath) ?: ""
+        val proxyUrl = "http://127.0.0.1:$port${session.uri}"
+
+        val subtitles = JSONArray()
+        val parent = decodedPath.substringBeforeLast('/', '')
+        if (parent.isNotEmpty()) {
+            val parentEntries = fetchIndex("$parent/") ?: emptyList()
+            for (e in parentEntries) {
+                if (!e.isDir && e.displayName.endsWith(".srt", true)) {
+                    val subPath = "$parent/${e.displayName}"
+                    val subUrl = buildUpstreamUrl(subPath)
+                    if (subUrl != null) {
+                        subtitles.put(
+                            JSONObject()
+                                .put("url", subUrl)
+                                .put("lang", "en")
+                                .put("name", e.displayName)
+                        )
+                    }
+                }
+            }
+        }
+
+        val obj = JSONObject()
+            .put("direct_url", directUrl)
+            .put("proxy_url", proxyUrl)
+            .put("subtitles", subtitles)
+        return jsonResponse(200, obj.toString())
+    }
+
+    private fun looksLikeMovie(name: String): Pair<String, String>? {
+        val m = Regex("""^(.+?)\s*\((\d{4})\)$""").find(name.trimEnd('/'))
+        return if (m != null) Pair(m.groupValues[1].trim(), m.groupValues[2]) else null
     }
 }
