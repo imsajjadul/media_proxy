@@ -1,22 +1,15 @@
 package com.mediaproxy
 
-import android.content.Context
 import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 
-class TmdbClient(context: Context) {
+class TmdbClient {
 
-    private val apiKey: String
+    private val apiKey = "31375adbc8e9efdf2b82af1edf2c5ea3"
     private val baseUrl = "https://api.themoviedb.org/3"
-    private val posterBase = "https://image.tmdb.org/t/p/w300"
-
-    init {
-        // Store your TMDB API key in res/values/strings.xml as <string name="tmdb_api_key">YOUR_KEY</string>
-        apiKey = context.getString(R.string.tmdb_api_key)
-    }
 
     fun searchMovie(title: String, year: String?): String? {
         return try {
